@@ -1,0 +1,432 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GenerateHeight0
+#pragma kernel GenerateGaussianMap
+#pragma kernel GenerateHeight
+#pragma kernel GenerateButterfly
+#pragma kernel IFFTHorizontalHeight
+#pragma kernel IFFTVerticalHeight
+#pragma kernel FinalHeight
+#pragma kernel GenerateNormalMap
+#pragma kernel IFFTHorizontalChoppy
+#pragma kernel IFFTVerticalChoppy
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> H0Texture;
+Texture2D<float4> H0InputTexture;
+RWTexture2D<float4> GaussianRandom;
+RWTexture2D<float4> ButterflyTex;
+
+RWTexture2D<float4> PingpongOutput;
+Texture2D<float4>   PingpongInput;
+RWTexture2D<float4> PingpongChoppyOutput;
+Texture2D<float4>   PingpongChoppyInput;
+Texture2D<float4>   ButterflyInput;
+RWTexture2D<float4> HeightTexture;
+RWTexture2D<float4> ChoppyTexture;
+Texture2D<float4>   DisplacementMap;
+RWTexture2D<float4> NormalMapTex;
+RWTexture2D<float4> GradTexture;
+
+#define PI 3.14159265359
+
+uniform int N;
+uniform float A;   //振幅
+uniform float2 windDirection;
+uniform float windSpeed;//风速
+uniform float gravity;//重力 Earth=>9.81
+uniform float time;   //当前时间
+uniform int stage;
+uniform float patchSize;
+uniform float heightScale;
+
+StructuredBuffer<float2> randomData1;
+StructuredBuffer<float2> randomData2;
+StructuredBuffer<int> reserveBit;
+
+
+float2 ComplexAdd(float2 complexA, float2 complexB) 
+{
+	float2 c;
+	c.x = complexA.x + complexB.x;
+	c.y = complexA.y + complexB.y;
+	return c;
+}
+
+float2 ComplexMul(float2 complexA, float2 complexB) 
+{
+	float real = complexA.x * complexB.x - complexA.y * complexB.y;
+	float img = complexA.x * complexB.y + complexA.y * complexB.x;
+	return float2(real, img);
+}
+
+
+float2 ComplexConj(float2 complexA) 
+{
+	return float2(complexA.x, -complexA.y);
+}
+
+float2 BoxMullerTransform(float2 random)
+{
+	float u1 = random.x;//RandValue(pixelPos);
+	float u2 = random.y;//RandValue(pixelPos);
+	if (u1 < 1e-6f)
+	{
+		u1 = 1e-6f;
+	}
+	float r1 = sqrt(-1 * log(u1));
+	//float r2 = sqrt(-1 * log(u2));
+	return float2(r1 * cos(2 * PI * u2), r1 * sin(2 * PI * u2));
+}
+
+// Box−Muller−Method
+float2 GaussRND(uint2 pixelPos)
+{
+	uint index = pixelPos.x + pixelPos.y * 256;
+	return randomData1[index];
+}
+
+float RandValue(uint2 pixelPos, float magic = 3571.0)
+{
+	float2 random2 = (1.0 / 4320.0) * pixelPos + float2(0.25, 0.0);
+	float random = frac(dot(random2 * random2, magic));
+	random = frac(random * random * (2 * magic));
+	return random;
+}
+
+float Gauss(uint2 pixelPos)
+{
+	float2 random = GaussRND(pixelPos);
+	float u1 = random.x;//RandValue(pixelPos);
+	float u2 = random.y;//RandValue(pixelPos);
+	if (u1 < 1e-6f)
+	{
+		u1 = 1e-6f;
+	}
+	float r1 = sqrt(-1 * log(u1));
+	//float r2 = sqrt(-1 * log(u2));
+	return r1 * cos(2 * PI * u2);
+}
+
+float PhillipsSpectrum(float2 kl, float2 windDirection, float windSpeed, float gravity, float A) {
+	float k = length(kl);//防止除0 NaN
+	if (k == 0) {
+		return 0;
+	}
+	float L = windSpeed * windSpeed / gravity;
+	float kdotw = dot(normalize(kl), normalize(windDirection));
+	float Phi = A * exp(-1.0 / (k*k*L*L)) / (k*k*k*k) * pow(kdotw, 2);// *exp(-k*k*pow(L / 2000.0, 2.0));
+
+	return Phi;
+}
+
+float2 H0(float kexiR, float kexiI, float phi)
+{
+	float tmp = 1.0 / sqrt(2.0) * sqrt(phi);
+	float2 h0 = float2(kexiR * tmp, kexiI * tmp);
+	return h0;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateGaussianMap(uint3 id : SV_DispatchThreadID)
+{
+	GaussianRandom[id.xy] = Gauss(id.xy);
+}
+
+[numthreads(8,8,1)]
+void GenerateHeight0(uint3 id : SV_DispatchThreadID)
+{
+	int2 X = id.xy - int2(N * 0.5, N * 0.5);
+	if (X.x == 0 && X.y == 0)
+	{
+		H0Texture[id.xy] = float4(0, 0, 0, 0);
+		return;
+	}
+	float2 K = float2(2.0 * PI * X.x / patchSize, 2.0 * PI * X.y / patchSize);
+	float phi = PhillipsSpectrum(K, windDirection, windSpeed, 9.81, A);
+	uint index = id.x + id.y * N;
+	float2 random = BoxMullerTransform(randomData1[index]);
+	float2 h0 = H0(random.x, random.y, phi);
+
+	float2 random2 = BoxMullerTransform(randomData2[index]);
+	float phi_c = PhillipsSpectrum(-K, windDirection, windSpeed, 9.81, A);
+	float2 h0_c = H0(random2.x, random2.y, phi_c);
+	H0Texture[id.xy] = float4(h0, h0_c);
+}
+
+//计算出T时刻频域h
+[numthreads(8, 8, 1)]
+void GenerateHeight(uint3 id : SV_DispatchThreadID)
+{
+	int2 X = id.xy - int2(N * 0.5, N * 0.5);
+	float unitRev = 1.0 / patchSize;
+	float2 K = float2(2.0 * PI * X.x * unitRev, 2.0 * PI * X.y * unitRev);
+	float k = max(0.00001f, length(K));
+	float w = sqrt(9.81 * k);
+
+	//欧拉公式
+	float coswt = cos(w * time);
+	float sinwt = sin(w * time);
+	float2 expwt = float2(coswt, sinwt);
+	float2 expwt_minus = float2(coswt, -sinwt);
+
+	float4 H0_Data = H0InputTexture[id.xy];
+	float2 H0 = H0_Data.xy;
+	float2 H0_minus = ComplexConj(H0_Data.zw);
+
+	float2 h = ComplexAdd(ComplexMul(H0, expwt), ComplexMul(H0_minus, expwt_minus));
+
+	//choppy
+	float2 dx = float2(0, -K.x / k);
+	float2 dz = float2(0, -K.y / k);
+
+	float sinKdX = sin(dot(K, float2(X)));
+	float cosKdX = cos(dot(K, float2(X)));
+
+	HeightTexture[id.xy] = float4(h, 0, 1);
+	ChoppyTexture[id.xy] = float4(-h.y * K.x, h.x * K.x, -h.y * K.y, h.x * K.y) / k;//float4(ComplexMul(dx, h), ComplexMul(dz, h));
+
+
+	//grad
+	//float2 gradx = float2(0, K.x);
+	//float2 gradz = float2(0, K.y);
+
+	//GradTexture[id.xy] = float4(ComplexMul(dx, h), ComplexMul(dz, h));
+}
+
+[numthreads(1, 8, 1)]
+void GenerateButterfly(uint3 id : SV_DispatchThreadID) {
+
+	float k = id.y * (float(N) / pow(2.0, id.x + 1)) % float(N);
+	//欧拉公式
+	float cos_wt = cos(2.0 * PI * k / float(N));
+	float sin_wt = sin(2.0 * PI * k / float(N));
+	float2 complex_twiddle = float2(cos_wt, sin_wt);
+
+	bool isTop = true;
+	if ((id.y % pow(2.0, id.x + 1)) < pow(2.0, id.x)) 
+	{
+		isTop = true;
+	}
+	else 
+	{
+		isTop = false;
+	}
+
+	uint span = uint(pow(2, id.x));
+
+	uint2 topAndBottomIndex = uint2(0, 0);
+	//第一阶段
+	if (id.x == 0) 
+	{
+		if (isTop == true) 
+		{
+			topAndBottomIndex = uint2(reserveBit[id.y], reserveBit[id.y + 1]);
+		}
+		else 
+		{
+			topAndBottomIndex = uint2(reserveBit[id.y - 1], reserveBit[id.y]);
+		}
+	}
+	else 
+	{
+		if (isTop == true) 
+		{
+			topAndBottomIndex = uint2(id.y, id.y + span);
+		}
+		else 
+		{
+			topAndBottomIndex = uint2(id.y - span, id.y);
+		}
+	}
+
+	//reserveBit[id.y];
+
+	ButterflyTex[id.xy] = float4(complex_twiddle, float2(topAndBottomIndex));
+}
+
+
+[numthreads(8, 8, 1)]
+void IFFTHorizontalHeight(uint3 id : SV_DispatchThreadID)
+{
+	float4 butterflyData = ButterflyInput[uint2(stage, id.x)];
+
+	//碟型运算的上部
+	float2 St = PingpongInput[uint2(butterflyData.z, id.y)].rg;
+
+	//碟型运算的下部
+	float2 Sb = PingpongInput[uint2(butterflyData.w, id.y)].rg;
+
+	float2 w = butterflyData.xy;
+
+	float2 h = ComplexAdd(St, ComplexMul(Sb, w));
+
+	PingpongOutput[id.xy] = float4(h, 0, 1);
+
+	/*
+	//Choppy
+	float4 choppyDataTop = PingpongChoppyInput[uint2(butterflyData.z, id.y)];
+	float2 topX = choppyDataTop.xy;
+	float2 topZ = choppyDataTop.zw;
+	float4 choppyDataBottom = PingpongChoppyInput[uint2(butterflyData.w, id.y)];
+	float2 bottomX = choppyDataBottom.xy;
+	float2 bottomZ = choppyDataBottom.zw;
+
+	float2 ChoppyX = ComplexAdd(topX, ComplexMul(bottomX, w));//蝴蝶操作
+	float2 ChoppyZ = ComplexAdd(topZ, ComplexMul(bottomZ, w));
+	PingpongChoppyOutput[id.xy] = float4(ChoppyX, ChoppyZ);
+	*/
+}
+
+[numthreads(8, 8, 1)]
+void IFFTVerticalHeight(uint3 id : SV_DispatchThreadID)
+{
+	float4 butterflyData = ButterflyInput[uint2(stage, id.y)];
+
+	//碟型运算的上部
+	float2 St = PingpongInput[uint2(id.x, butterflyData.z)].rg;
+
+	//碟型运算的下部
+	float2 Sb = PingpongInput[uint2(id.x, butterflyData.w)].rg;
+
+	float2 w = butterflyData.xy;
+
+	float2 h = ComplexAdd(St, ComplexMul(Sb, w));
+
+	PingpongOutput[id.xy] = float4(h, 0, 1);
+
+	/*
+	//Choppy
+	float4 choppyData = PingpongChoppyInput[uint2(id.x, butterflyData.z)];
+	float2 topX = choppyData.xy;
+	float2 topZ = choppyData.zw;
+	float4 choppyData2 = PingpongChoppyInput[uint2(id.x, butterflyData.w)];
+	float2 bottomX = choppyData2.xy;
+	float2 bottomZ = choppyData2.zw;
+
+	float2 ChoppyX = ComplexAdd(topX, ComplexMul(bottomX, w));//蝴蝶操作
+	float2 ChoppyZ = ComplexAdd(topZ, ComplexMul(bottomZ, w));
+
+	PingpongChoppyOutput[id.xy] = float4(ChoppyX, ChoppyZ);
+	*/
+}
+
+
+
+[numthreads(8, 8, 1)]
+void IFFTHorizontalChoppy(uint3 id : SV_DispatchThreadID)
+{
+	float4 butterflyData = ButterflyInput[uint2(stage, id.x)];
+
+	float2 w = butterflyData.xy;
+
+	//Choppy
+	float4 choppyDataTop = PingpongChoppyInput[uint2(butterflyData.z, id.y)];
+	float2 topX = choppyDataTop.xy;
+	float2 topZ = choppyDataTop.zw;
+	float4 choppyDataBottom = PingpongChoppyInput[uint2(butterflyData.w, id.y)];
+	float2 bottomX = choppyDataBottom.xy;
+	float2 bottomZ = choppyDataBottom.zw;
+
+	float2 ChoppyX = ComplexAdd(topX, ComplexMul(bottomX, w));//蝴蝶操作
+	float2 ChoppyZ = ComplexAdd(topZ, ComplexMul(bottomZ, w));
+
+	PingpongChoppyOutput[id.xy] = float4(ChoppyX, ChoppyZ);
+}
+
+[numthreads(8, 8, 1)]
+void IFFTVerticalChoppy(uint3 id : SV_DispatchThreadID)
+{
+	float4 butterflyData = ButterflyInput[uint2(stage, id.y)];
+
+	float2 w = butterflyData.xy;
+
+	//Choppy
+	float4 choppyData = PingpongChoppyInput[uint2(id.x, butterflyData.z)];
+	float2 topX = choppyData.xy;
+	float2 topZ = choppyData.zw;
+	float4 choppyData2 = PingpongChoppyInput[uint2(id.x, butterflyData.w)];
+	float2 bottomX = choppyData2.xy;
+	float2 bottomZ = choppyData2.zw;
+
+	float2 ChoppyX = ComplexAdd(topX, ComplexMul(bottomX, w));//蝴蝶操作
+	float2 ChoppyZ = ComplexAdd(topZ, ComplexMul(bottomZ, w));
+
+	PingpongChoppyOutput[id.xy] = float4(ChoppyX, ChoppyZ);
+}
+
+[numthreads(8, 8, 1)]
+void FinalHeight(uint3 id : SV_DispatchThreadID)
+{
+	float params[] = { 1.0, -1.0 };
+	uint index = uint(id.x + id.y) % 2;
+	float f = params[index];
+
+	float4 height = PingpongInput[id.xy];
+
+	float4 choppy = PingpongChoppyInput[id.xy];
+
+	//height.xyz /= float(N * N);
+
+	float3 vertexData = float3(choppy.x, height.x * heightScale, choppy.z) / float(N);  //本来是 float(N * N)，因为除以N*N太小了，所以这里简化成N;
+
+	HeightTexture[id.xy] = float4(vertexData * f, 0);
+}
+
+float4 SampleDisplacement(int2 coord, int size)
+{
+	coord.x += coord.x < 0 ? size : (coord.x >= size ? -size : 0);
+	coord.y += coord.y < 0 ? size : (coord.y >= size ? -size : 0);
+	return DisplacementMap[coord]; // *float4(1.0, size, 1.0, 1.0);  //之前fft后除了N，所以这里不需要除N了，但
+}
+
+[numthreads(8, 8, 1)]
+void GenerateNormalMap(uint3 coord : SV_DispatchThreadID) {
+	//使用有限差分来计算导数
+
+	/*float scale = float(N) / unit;
+	float2 d_offset= - DisplacementMap[coord.xy].xz*scale;
+	*/
+
+	float3 offset = float3(-1, 0, 1);
+
+	float4 xLeft = SampleDisplacement(coord.xy + offset.xy, N);
+	float4 xRight = SampleDisplacement(coord.xy + offset.zy, N);
+	float4 yTop = SampleDisplacement(coord.xy + offset.yx, N);
+	float4 yBottom = SampleDisplacement(coord.xy + offset.yz, N);
+	float4 center = DisplacementMap[coord.xy];
+	center.y = 0;
+
+	float texelSize = patchSize / N;
+	float3 tangentR2L = float3(2.0 * texelSize, (xRight.y - xLeft.y), 0);
+	float3 binormalT2B = float3(0, (yBottom.y - yTop.y), 2.0 * texelSize);
+	float3 normal = cross(binormalT2B, tangentR2L);
+	//float3 normal = float3(x2.y - x1.y, y2.y - y1.y, 0);
+	normal = normalize(normal);
+
+	float2 dx = (xRight.xz - xLeft.xz);
+	float2 dz = (yBottom.xz - yTop.xz);
+	//float dxz = 1 + (xRight.z - xLeft.z) * N * 0.5;
+	float Jacobian = (1.0f + dx.x) * (1.0f + dz.y) - dx.y * dz.x;
+	float fold = max(1.0f - saturate(Jacobian), 0);
+
+	//normal = float3(0, 1, 0);
+	//NormalMapTex[coord.xy] = float4(-dx.y, -dz.y, 2.0f * texelSize, fold);
+	//NormalMapTex[coord.xy] = float4(normal, fold);
+
+
+	//float3 right = float3(texelSize, 0, 0) + xRight - center;
+	//float3 left = float3(-texelSize, 0, 0) + xLeft - center;
+	//float3 top = float3(0, 0, -texelSize) + yTop - center;
+	//float3 bottom = float3(0, 0, texelSize) + yBottom - center;
+
+	//float3 topRight = cross(right, top);
+	//float3 topLeft = cross(top, left);
+	//float3 bottomLeft = cross(left, bottom);
+	//float3 bottomRight = cross(bottom, right);
+	//normal = normalize(topRight + topLeft + bottomLeft + bottomRight);
+
+	NormalMapTex[coord.xy] = float4(normal, fold);
+}
+
+
